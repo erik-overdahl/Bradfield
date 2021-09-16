@@ -89,7 +89,7 @@ func compute(memory []byte) {
 		case Halt:
 			return
 		default:
-			panic(fmt.Errorf("Unknown opcode: %b", op))
+			panic(fmt.Errorf("Unknown opcode: %#x", op))
 		}
 	}
 }
