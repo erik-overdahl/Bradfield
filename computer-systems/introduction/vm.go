@@ -1,7 +1,5 @@
 package vm
 
-import "fmt"
-
 const (
 	Load  = 0x01
 	Store = 0x02
@@ -28,68 +26,66 @@ const (
 // ^==DATA===============^ ^==INSTRUCTIONS==============^
 //
 func compute(memory []byte) {
+	if len(memory) > 256 {
+		panic("Out of memory")
+	}
 
 	registers := [3]byte{8, 0, 0} // PC, R1 and R2
 
-	// Keep looping, like a physical computer's clock
-	for {
-		position := registers[0]
-		op := memory[position]
-
-		switch op {
-		case Load:
-			// increment PC
-			registers[0] += 3
-			reg := memory[position+1]
-			addr := memory[position+2]
-			// load data at dataAddr into register reg
+	instructions := [9]func(byte, []byte, *[3]byte) byte{
+		Load: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg, addr := memory[pc+1], memory[pc+2]
 			registers[reg] = memory[addr]
-		case Store:
-			registers[0] += 3
-			reg := memory[position+1]
-			addr := memory[position+2]
-			// load data at dataAddr into register reg
+			return pc + 3
+		},
+		Store: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg, addr := memory[pc+1], memory[pc+2]
+			if addr > 7 {
+				panic("Illegal write to read-only memory!")
+			}
 			memory[addr] = registers[reg]
-		case Add:
-			registers[0] += 3
-			reg1 := memory[position+1]
-			reg2 := memory[position+2]
-			// add register values, store in reg1
+			return pc + 3
+		},
+		Add: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg1, reg2 := memory[pc+1], memory[pc+2]
 			registers[reg1] += registers[reg2]
-		case Sub:
-			registers[0] += 3
-			reg1 := memory[position+1]
-			reg2 := memory[position+2]
-			// add register values, store in reg1
+			return pc + 3
+		},
+		Sub: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg1, reg2 := memory[pc+1], memory[pc+2]
 			registers[reg1] -= registers[reg2]
-		case Addi:
-			registers[0] += 3
-			reg := memory[position+1]
-			val := memory[position+2]
-			// add val to value stored in register
+			return pc + 3
+		},
+		Addi: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg, val := memory[pc+1], memory[pc+2]
 			registers[reg] += val
-		case Subi:
-			registers[0] += 3
-			reg := memory[position+1]
-			val := memory[position+2]
-			// subtract val from value stored in register
+			return pc + 3
+		},
+		Subi: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg, val := memory[pc+1], memory[pc+2]
 			registers[reg] -= val
-		case Jump:
-			jumpTo := memory[position+1]
-			// set PC to addr specified in arg
-			registers[0] = jumpTo
-		case Beqz:
-			registers[0] += 3
-			reg := memory[position+1]
-			offset := memory[position+2]
+			return pc + 3
+		},
+		Jump: func(pc byte, memory []byte, registers *[3]byte) byte {
+			return memory[pc+1]
+		},
+		Beqz: func(pc byte, memory []byte, registers *[3]byte) byte {
+			reg, offset := memory[pc+1], memory[pc+2]
 			// move PC by offset conditional on value in reg
 			if registers[reg] == 0 {
-				registers[0] += offset
+				pc += offset
 			}
-		case Halt:
+			return pc + 3
+		},
+	}
+	var pc, op byte
+	// Keep looping, like a physical computer's clock
+	for {
+		pc = registers[0]
+		op = memory[pc]
+		if op == Halt {
 			return
-		default:
-			panic(fmt.Errorf("Unknown opcode: %#x", op))
 		}
+		registers[0] = instructions[op](pc, memory, &registers)
 	}
 }
