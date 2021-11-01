@@ -1,0 +1,401 @@
+#+TITLE: Implementation Prework Solutions
+#+PROPERTY: header-args:go :noweb yes
+
+* Instructions
+Consider the following interface for an "ID service":
+
+#+NAME: interface
+#+begin_src go
+type idService interface {
+	// Returns values in ascending order; it should be safe to call
+	// getNext() concurrently without any additional synchronization.
+	getNext() uint64
+}
+#+end_src
+
+Implement this interface using each of the following four strategies:
+
+- Don't perform any synchronization
+- Atomically increment a counter value using =sync/atomic=
+- Use a =sync.Mutex= to guard access to a shared counter value
+- Launch a separate goroutine with exclusive access to a private counter
+  value; handle =getNext()= calls by making “requests” and receiving
+  “responses” on two separate channels
+
+Aside from the first (obviously incorrect) strategy, ensure that your
+implementations are correct by making sure that:
+
+- In the context of a particular goroutine making calls to =getNext()=,
+  returned values are monotonically increasing
+- The maximum value returned by =getNext()= matches the total number of
+  calls across all goroutines
+- [[https://blog.golang.org/race-detector][Go's race detector]] doesn't detect any race conditions
+
+How do you expect these different strategies to compare in terms of
+performance? What are the bottlenecks in each case?
+
+
+* Implementations
+#+begin_src go :tangle ./implementation_prework.go
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
+<<interface>>
+<<no-sync>>
+<<atomic>>
+<<mutex>>
+<<goroutines>>
+#+end_src
+
+** No synchronization
+The naive, non-synchronized version just has an ~id~ variable that gets
+incremented with each call to =getNext()=
+
+#+NAME: no-sync
+#+begin_src go
+type noSyncIdService struct {
+	id uint64
+}
+
+func (i *noSyncIdService) getNext() uint64 {
+	i.id++
+	return i.id
+}
+#+end_src
+
+** Atomic counter
+The atomic version is implemented using the ~sync/atomic~ package.
+
+#+NAME: atomic
+#+begin_src go
+type atomicIdService struct {
+	id uint64
+}
+
+func (i *atomicIdService) getNext() uint64 {
+	return atomic.AddUint64(&i.id, 1)
+}
+#+end_src
+
+** Mutex counter
+By adding a mutex member variable to the struct, we can can lock and
+unlock the id variable with each call to =getNext()=
+
+#+NAME: mutex
+#+begin_src go
+type mutexIdService struct {
+	sync.Mutex
+	id uint64
+}
+
+func (i *mutexIdService) getNext() uint64 {
+	i.Lock()
+	defer i.Unlock()
+	i.id += 1
+	return i.id
+}
+#+end_src
+
+** Goroutines
+Now, instead of a mutex, we will use 2 channels, one for requesting an
+id and one for responding with an id. To request an idea, we signal the
+~requests~ channel by sending an emtpy struct, and then read our results
+from the ~responses~ channel. This requires a bit of extra scaffolding.
+We now need a constructor function that will create our ~idService~ with
+the two channels.
+
+#+NAME: goroutines
+#+begin_src go
+type goroutineIdService struct {
+	requests  chan struct{}
+	responses chan uint64
+	id 	  uint64
+}
+
+func makeGoroutineIdService() *goroutineIdService {
+	service := goroutineIdService{
+		requests:  make(chan struct{}),
+		responses: make(chan uint64),
+	}
+	service.Start()
+	return &service
+}
+
+<<goroutines-methods>>
+#+end_src
+
+The service must be initialized by starting the ~responses~ channel
+listening to the ~requests~ channel. Using a loop with the =range=
+means that the ~responses~ channel will close if the ~requests~ channel
+is closed. The service can then be stopped by closing just the requests
+channel.
+
+#+NAME: goroutines-methods
+#+begin_src go
+func (s *goroutineIdService) Start() {
+	go func(){
+		for range s.requests {
+			s.id += 1
+			s.responses <- s.id
+		}
+	}
+}
+
+func (s *goroutineIdService) Stop() {
+	close(s.requests)
+}
+
+func (s *goroutineIdService) getNext() uint64 {
+	s.requests <- struct{}{}
+	return <-s.responses
+}
+#+end_src
+
+
+* Testing
+#+begin_src go :tangle ./implementation_prework_test.go
+package main
+
+import (
+	"fmt"
+	"testing"
+)
+
+<<test-setup>>
+<<validation-tests>>
+<<benchmarks>>
+#+end_src
+
+First, let's define our setup. We'll create a ~testCase~ struct that has
+a name and a way of getting a new instance of the case. These can then
+be used for both the validation tests and the benchmarks.
+
+#+NAME: test-setup
+#+begin_src go
+type testCase struct {
+	name    string
+	service func() (idService, func())
+}
+
+func setup() []testCase {
+	goroutineService := MakeGoroutineIdService()
+	goroutineService.Start()
+
+	return []testCase{
+		{"no-sync", func() (idService, func()) {
+			service := &noSyncIdService{}
+			teardown := func() {}
+			return service, teardown
+		}},
+		{"atomic", func() (idService, func()) {
+			service := &atomicIdService{}
+			teardown := func() {}
+			return service, teardown
+		}},
+		{"mutex", func() (idService, func()) {
+			service := &mutexIdService{}
+			teardown := func() {}
+			return service, teardown
+		}},
+		{"goroutines", func() (idService, func()) {
+			service := MakeGoroutineIdService()
+			service.Start()
+			teardown := func() { service.Stop() }
+			return service, teardown
+		}},
+	}
+}
+#+end_src
+
+** Validation
+We have two things to validate: that the service provides monotonically
+increasing ids, and that the maximum value from =getNext()= is equal to
+the number of calls made across all threads.
+
+To test the monotonicity property, we check /per worker/. We cannot
+expect the ids to be monotonically increasing across all workers.
+
+Notice that we use ~errgroup~ rather than ~WaitGroup~ so that we can
+handle errors that occur in the workers.
+
+#+NAME: validation-tests
+#+begin_src go
+func RunService(t *testing.T, service idService, numWorkers, numCalls int) {
+	t.Helper()
+
+	var eg errgroup.Group
+	idChan := make(chan uint64, numWorkers*numCalls)
+
+	for i := 0; i < numWorkers; i++ {
+		eg.Go(func() error {
+			lastId := uint64(0)
+			for j := 0; j < numCalls; j++ {
+				id := service.getNext()
+				if id < lastId {
+					return fmt.Errorf("Ids not monotonically increasing: got %d after %d", id, lastId)
+				}
+				idChan <- id
+			}
+			return nil
+		})
+	}
+
+	err := eg.Wait()
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	close(idChan)
+
+	expectedMax := numWorkers * numCalls
+	maxId := uint64(0)
+	for id := range idChan {
+		if maxId < id {
+			maxId = id
+		}
+	}
+	if maxId != uint64(expectedMax) {
+		t.Fatalf("Max id across workers incorrect: expected %d, got %d", expectedMax, maxId)
+	}
+}
+
+func TestServices(t *testing.T) {
+	cases := setup()
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			RunService(t, testCase.service, 10, 10000)
+		})
+	}
+}
+#+end_src
+
+And here are the results
+
+#+begin_src sh :results verbatim
+go test -v --race
+echo
+#+end_src
+
+#+RESULTS:
+#+begin_example
+=== RUN   TestServices
+=== RUN   TestServices/no-sync
+==================
+WARNING: DATA RACE
+Read at 0x00c0001a40a8 by goroutine 12:
+  implementation.(*noSyncIdService).getNext()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:18 +0x3e
+  implementation.RunService.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:54 +0x70
+  golang.org/x/sync/errgroup.(*Group).Go.func1()
+      /home/francis/go/pkg/mod/golang.org/x/sync@v0.0.0-20210220032951-036812b2e83c/errgroup/errgroup.go:57 +0x94
+
+Previous write at 0x00c0001a40a8 by goroutine 11:
+  implementation.(*noSyncIdService).getNext()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:18 +0x54
+  implementation.RunService.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:54 +0x70
+  golang.org/x/sync/errgroup.(*Group).Go.func1()
+      /home/francis/go/pkg/mod/golang.org/x/sync@v0.0.0-20210220032951-036812b2e83c/errgroup/errgroup.go:57 +0x94
+
+Goroutine 12 (running) created at:
+  golang.org/x/sync/errgroup.(*Group).Go()
+      /home/francis/go/pkg/mod/golang.org/x/sync@v0.0.0-20210220032951-036812b2e83c/errgroup/errgroup.go:54 +0x73
+  implementation.RunService()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:51 +0xf9
+  implementation.TestServices.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:89 +0x104
+  testing.tRunner()
+      /usr/lib/golang/src/testing/testing.go:1193 +0x202
+
+Goroutine 11 (running) created at:
+  golang.org/x/sync/errgroup.(*Group).Go()
+      /home/francis/go/pkg/mod/golang.org/x/sync@v0.0.0-20210220032951-036812b2e83c/errgroup/errgroup.go:54 +0x73
+  implementation.RunService()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:51 +0xf9
+  implementation.TestServices.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:89 +0x104
+  testing.tRunner()
+      /usr/lib/golang/src/testing/testing.go:1193 +0x202
+==================
+    implementation_prework_test.go:89: Max id across workers incorrect: expected 100000, got 95245
+    testing.go:1092: race detected during execution of test
+=== RUN   TestServices/atomic
+=== RUN   TestServices/mutex
+=== RUN   TestServices/goroutines
+==================
+WARNING: DATA RACE
+Read at 0x00c000524010 by goroutine 45:
+  implementation.(*goroutineIdService).Start.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:60 +0x67
+
+Previous write at 0x00c000524010 by goroutine 44:
+  implementation.(*goroutineIdService).Start.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:61 +0xd3
+
+Goroutine 45 (running) created at:
+  implementation.(*goroutineIdService).Start()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:58 +0x4c
+  implementation.setup.func4()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:37 +0xf2
+  implementation.TestServices.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:87 +0x79
+  testing.tRunner()
+      /usr/lib/golang/src/testing/testing.go:1193 +0x202
+
+Goroutine 44 (running) created at:
+  implementation.(*goroutineIdService).Start()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:58 +0x4c
+  implementation.MakeGoroutineIdService()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework.go:53 +0xe4
+  implementation.setup.func4()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:36 +0x2f
+  implementation.TestServices.func1()
+      /home/francis/Bradfield/advanced-programming/concurrency/implementation/implementation_prework_test.go:87 +0x79
+  testing.tRunner()
+      /usr/lib/golang/src/testing/testing.go:1193 +0x202
+==================
+    implementation_prework_test.go:89: Max id across workers incorrect: expected 100000, got 99712
+    testing.go:1092: race detected during execution of test
+=== CONT  TestServices
+    testing.go:1092: race detected during execution of test
+--- FAIL: TestServices (1.79s)
+    --- FAIL: TestServices/no-sync (0.19s)
+    --- PASS: TestServices/atomic (0.24s)
+    --- PASS: TestServices/mutex (0.45s)
+    --- FAIL: TestServices/goroutines (0.91s)
+=== CONT
+    testing.go:1092: race detected during execution of test
+FAIL
+exit status 1
+FAIL	implementation	1.833s
+
+#+end_example
+
+Some how, I'm getting a data race for the goroutine version. Not sure why.
+
+** Benchmarking
+#+NAME: benchmarks
+#+begin_src go
+func BenchmarkServices(b *testing.B) {
+	cases := setup()
+	for _, testCase := range cases {
+		b.Run(testCase.name, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				service, teardown := testCase.service()
+				defer teardown()
+				RunService(b, service, 10, 10000)
+			}
+		})
+	}
+}
+#+end_src
+
+#+begin_src sh :results verbatim
+go test -v --race --bench ./
+echo
+#+end_src
